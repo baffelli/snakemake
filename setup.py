@@ -1,8 +1,9 @@
+# -*- coding: UTF-8 -*-
+
 __author__ = "Johannes Köster"
 __copyright__ = "Copyright 2015, Johannes Köster"
 __email__ = "koester@jimmy.harvard.edu"
 __license__ = "MIT"
-
 
 from setuptools.command.test import test as TestCommand
 import sys

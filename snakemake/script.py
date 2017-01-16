@@ -24,6 +24,8 @@ from snakemake.version import MIN_PY_VERSION
 
 
 PY_VER_RE = re.compile("Python (?P<ver_min>\d+\.\d+).*:")
+# TODO use this to find the right place for inserting the preamble
+PY_PREAMBLE_RE = re.compile(r"from( )+__future__( )+import.*?(?P<end>[;\n])")
 
 
 class REncoder:
@@ -33,15 +35,15 @@ class REncoder:
     def encode_value(cls, value):
         if isinstance(value, str):
             return repr(value)
-        if isinstance(value, collections.Iterable):
-            # convert all iterables to vectors
-            return cls.encode_list(value)
         elif isinstance(value, dict):
             return cls.encode_dict(value)
         elif isinstance(value, bool):
             return "TRUE" if value else "FALSE"
         elif isinstance(value, int) or isinstance(value, float):
             return str(value)
+        elif isinstance(value, collections.Iterable):
+            # convert all iterables to vectors
+            return cls.encode_list(value)
         else:
             # Try to convert from numpy if numpy is present
             try:
@@ -72,10 +74,10 @@ class REncoder:
 
     @classmethod
     def encode_namedlist(cls, namedlist):
-        positional = cls.encode_list(namedlist)
+        positional = ", ".join(map(cls.encode_value, namedlist))
         named = cls.encode_items(namedlist.items())
         source = "list("
-        if positional != "c()":
+        if positional:
             source += positional
         if named:
             source += ", " + named
@@ -85,7 +87,7 @@ class REncoder:
 
 class Snakemake:
     def __init__(self, input, output, params, wildcards, threads, resources,
-                 log, config):
+                 log, config, rulename):
         self.input = input
         self.output = output
         self.params = params
@@ -94,6 +96,7 @@ class Snakemake:
         self.resources = resources
         self.log = log
         self.config = config
+        self.rule = rulename
 
     def log_fmt_shell(self, stdout=True, stderr=True, append=False):
         """
@@ -146,7 +149,7 @@ class Snakemake:
 
 
 def script(path, basedir, input, output, params, wildcards, threads, resources,
-           log, config, conda_env):
+           log, config, rulename, conda_env):
     """
     Load a script from the given basedir + path and execute it.
     Supports Python 3 and R.
@@ -163,8 +166,10 @@ def script(path, basedir, input, output, params, wildcards, threads, resources,
         with urlopen(path) as source:
             if path.endswith(".py"):
                 snakemake = Snakemake(input, output, params, wildcards,
-                                      threads, resources, log, config)
+                                      threads, resources, log, config, rulename)
                 snakemake = pickle.dumps(snakemake)
+                # obtain search path for current snakemake module
+                # the module is needed for unpickling in the script
                 searchpath = os.path.dirname(os.path.dirname(__file__))
                 preamble = textwrap.dedent("""
                 ######## Snakemake header ########
@@ -185,7 +190,8 @@ def script(path, basedir, input, output, params, wildcards, threads, resources,
                         threads = "numeric",
                         log = "list",
                         resources = "list",
-                        config = "list"
+                        config = "list",
+                        rule = "character"
                     )
                 )
                 snakemake <- Snakemake(
@@ -196,7 +202,8 @@ def script(path, basedir, input, output, params, wildcards, threads, resources,
                     threads = {},
                     log = {},
                     resources = {},
-                    config = {}
+                    config = {},
+                    rule = {}
                 )
                 ######## Original script #########
                 """).format(REncoder.encode_namedlist(input),
@@ -208,16 +215,23 @@ def script(path, basedir, input, output, params, wildcards, threads, resources,
                                name: value
                                for name, value in resources.items()
                                if name != "_cores" and name != "_nodes"
-                           }), REncoder.encode_dict(config))
+                           }), REncoder.encode_dict(config), REncoder.encode_value(rulename))
             else:
                 raise ValueError(
                     "Unsupported script: Expecting either Python (.py) or R (.R) script.")
 
-            dir = ".snakemake/scripts"
-            os.makedirs(dir, exist_ok=True)
+            if path.startswith("file://"):
+                # in case of local path, use the same directory
+                dir = os.path.dirname(path)[7:]
+                prefix = ".snakemake."
+            else:
+                dir = ".snakemake/scripts"
+                prefix = ""
+                os.makedirs(dir, exist_ok=True)
+
             with tempfile.NamedTemporaryFile(
                 suffix="." + os.path.basename(path),
-                prefix="",
+                prefix=prefix,
                 dir=dir,
                 delete=False) as f:
                 f.write(preamble.encode())
@@ -227,11 +241,19 @@ def script(path, basedir, input, output, params, wildcards, threads, resources,
                 if conda_env is not None:
                     py = os.path.join(conda_env, "bin", "python")
                     if os.path.exists(py):
-                        out = subprocess.check_output([py, "--version"])
+                        out = subprocess.check_output([py, "--version"],
+                                                      stderr=subprocess.STDOUT,
+                                                      universal_newlines=True)
                         ver = tuple(map(int, PY_VER_RE.match(out).group("ver_min").split(".")))
-                        if not ver >= MIN_PY_VERSION:
-                            raise WorkflowError("Conda environments for scripts need at least Python version {}.{}.".format(*MIN_PY_VERSION))
-                        py_exec = "python"
+                        if ver >= MIN_PY_VERSION:
+                            # Python version is new enough, make use of environment
+                            # to execute script
+                            py_exec = "python"
+                        else:
+                            logger.info("Conda environment defines Python "
+                                        "version < {}.{}. Using Python of the "
+                                        "master process to execute "
+                                        "script.".format(*MIN_PY_VERSION))
                 # use the same Python as the running process or the one from the environment
                 shell("{py_exec} {f.name}")
             elif path.endswith(".R"):

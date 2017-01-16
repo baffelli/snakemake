@@ -12,13 +12,15 @@ from collections import defaultdict, Iterable
 
 from snakemake.io import IOFile, _IOFile, protected, temp, dynamic, Namedlist, AnnotatedString, contains_wildcard_constraints, update_wildcard_constraints
 from snakemake.io import expand, InputFiles, OutputFiles, Wildcards, Params, Log, Resources
-from snakemake.io import apply_wildcards, is_flagged, not_iterable
+from snakemake.io import apply_wildcards, is_flagged, not_iterable, is_callable
 from snakemake.exceptions import RuleException, IOFileException, WildcardError, InputFunctionException, WorkflowError
 from snakemake.logging import logger
+from snakemake.common import Mode
 
 
 class Rule:
-    def __init__(self, *args, lineno=None, snakefile=None):
+    def __init__(self, *args, lineno=None, snakefile=None,
+                 restart_times=0):
         """
         Create a rule
 
@@ -45,7 +47,7 @@ class Rule:
             self.shadow_depth = None
             self.resources = dict(_cores=1, _nodes=1)
             self.priority = 0
-            self.version = None
+            self._version = None
             self._log = Log()
             self._benchmark = None
             self._conda_env = None
@@ -57,6 +59,8 @@ class Rule:
             self.script = None
             self.wrapper = None
             self.norun = False
+            self.is_branched = False
+            self.restart_times = 0
         elif len(args) == 1:
             other = args[0]
             self.name = other.name
@@ -89,6 +93,8 @@ class Rule:
             self.script = other.script
             self.wrapper = other.wrapper
             self.norun = other.norun
+            self.is_branched = True
+            self.restart_times = other.restart_times
 
     def dynamic_branch(self, wildcards, input=True):
         def get_io(rule):
@@ -171,6 +177,16 @@ class Rule:
         return bool(self.wildcard_names)
 
     @property
+    def version(self):
+        return self._version
+
+    @version.setter
+    def version(self, version):
+        if isinstance(version, str) and "\n" in version:
+            raise WorkflowError("Version string may not contain line breaks.", rule=self)
+        self._version = version
+
+    @property
     def benchmark(self):
         return self._benchmark
 
@@ -218,6 +234,8 @@ class Rule:
         """
         Add a list of output files. Recursive lists are flattened.
 
+        After creating the output files, they are checked for duplicates.
+
         Arguments
         output -- the list of output files
         """
@@ -239,6 +257,27 @@ class Rule:
                                           self.name))
             else:
                 self.wildcard_names = wildcards
+        # Check output file name list for duplicates
+        self.check_output_duplicates()
+
+    def check_output_duplicates(self):
+        """Check ``Namedlist`` for duplicate entries and raise a ``WorkflowError``
+        on problems.
+        """
+        seen = dict()
+        idx = None
+        for name, value in self.output.allitems():
+            if name is None:
+                if idx is None:
+                    idx = 0
+                else:
+                    idx += 1
+            if value in seen:
+                raise WorkflowError(
+                    "Duplicate output file pattern in rule {}. First two "
+                    "duplicate for entries {} and {}".format(
+                        self.name, seen[value], name or idx))
+            seen[value] = name or idx
 
     def _set_inoutput_item(self, item, output=False, name=None):
         """
@@ -252,9 +291,10 @@ class Rule:
         inoutput = self.output if output else self.input
         if isinstance(item, str):
             # add the rule to the dependencies
-            if isinstance(item, _IOFile):
+            if isinstance(item, _IOFile) and item.rule:
                 self.dependencies[item] = item.rule
             if output:
+                rule = self
                 if self.wildcard_constraints or self.workflow._wildcard_constraints:
                     try:
                         item = update_wildcard_constraints(
@@ -266,10 +306,12 @@ class Rule:
                             snakefile=self.snakefile,
                             lineno=self.lineno)
             else:
-                if contains_wildcard_constraints(item):
+                rule = None
+                if contains_wildcard_constraints(item) and self.workflow.mode != Mode.subprocess:
                     logger.warning(
                         "wildcard constraints in inputs are ignored")
-            _item = IOFile(item, rule=self)
+            # record rule if this is an output file output
+            _item = IOFile(item, rule=rule)
             if is_flagged(item, "temp"):
                 if output:
                     self.temp_output.add(_item)
@@ -373,6 +415,8 @@ class Rule:
                 snakefile=self.snakefile)
 
     def apply_input_function(self, func, wildcards, **aux_params):
+        if isinstance(func, _IOFile):
+            func = func._file.callable
         sig = inspect.signature(func)
         _aux_params = {k: v for k, v in aux_params.items() if k in sig.parameters}
         try:
@@ -392,26 +436,47 @@ class Rule:
         for name, item in olditems.allitems():
             start = len(newitems)
             is_iterable = True
+            is_unpack = is_flagged(item, "unpack")
 
-            if callable(item):
+            if is_callable(item):
                 item = self.apply_input_function(item, wildcards, **aux_params)
 
-            if not_iterable(item) or no_flattening:
-                item = [item]
-                is_iterable = False
-            for item_ in item:
-                if check_return_type and not isinstance(item_, str):
-                    raise WorkflowError("Function did not return str or list "
-                                        "of str.", rule=self)
-                concrete = concretize(item_, wildcards)
-                newitems.append(concrete)
-                if mapping is not None:
-                    mapping[concrete] = item_
+            if is_unpack:
+                # Sanity checks before interpreting unpack()
+                if not isinstance(item, (list, dict)):
+                    raise WorkflowError(
+                        "Can only use unpack() on list and dict", rule=self)
+                if name:
+                    raise WorkflowError(
+                        "Cannot combine named input file with unpack()",
+                        rule=self)
+                # Allow streamlined code with/without unpack
+                if isinstance(item, list):
+                    pairs = zip([None] * len(item), item)
+                else:
+                    assert isinstance(item, dict)
+                    pairs = item.items()
+            else:
+                pairs = [(name, item)]
 
-            if name:
-                newitems.set_name(
-                    name, start,
-                    end=len(newitems) if is_iterable else None)
+            for name, item in pairs:
+                if not_iterable(item) or no_flattening:
+                    item = [item]
+                    is_iterable = False
+                for item_ in item:
+                    if check_return_type and not isinstance(item_, str):
+                        raise WorkflowError("Function did not return str or list "
+                                            "of str.", rule=self)
+                    concrete = concretize(item_, wildcards)
+                    newitems.append(concrete)
+                    if mapping is not None:
+                        mapping[concrete] = item_
+
+                if name:
+                    newitems.set_name(
+                        name, start,
+                        end=len(newitems) if is_iterable else None)
+                    start = len(newitems)
 
     def expand_input(self, wildcards):
         def concretize_iofile(f, wildcards):
@@ -482,6 +547,9 @@ class Rule:
 
         for f in output:
             f.check()
+
+        # Note that we do not need to check for duplicate file names after
+        # expansion as all output patterns have contain all wildcards anyway.
 
         return output, mapping
 

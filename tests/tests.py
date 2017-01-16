@@ -12,17 +12,21 @@ import hashlib
 import urllib
 from shutil import rmtree, which
 from shlex import quote
+from nose.tools import nottest
 
 from snakemake import snakemake
+
+
+if not which("snakemake"):
+    raise Exception("snakemake not in PATH. For testing, install snakemake with "
+                    "'pip install -e .'. You should do this in a separate environment "
+                    "(via conda or virtualenv).")
 
 
 def dpath(path):
     """get path to a data file (relative to the directory this
 	test lives in)"""
     return os.path.realpath(join(os.path.dirname(__file__), path))
-
-
-SCRIPTPATH = dpath("../bin/snakemake")
 
 
 def md5sum(filename):
@@ -69,19 +73,18 @@ def run(path,
                 subpath), '{} does not exist'.format(subpath)
             subworkdir = os.path.join(tmpdir, "subworkdir")
             os.mkdir(subworkdir)
-            call('find {} -maxdepth 1 -type f -print0 | xargs -0 cp -t {}'.format(
+            call('find {} -maxdepth 1 -type f -print0 | xargs -0 -I%% -n 1 cp %% {}'.format(
                 quote(subpath), quote(subworkdir)),
                  shell=True)
             config['subworkdir'] = subworkdir
 
-        call('find {} -maxdepth 1 -type f -print0 | xargs -0 cp -t {}'.format(
+        call('find {} -maxdepth 1 -type f -print0 | xargs -0 -I%% -n 1 cp %% {}'.format(
             quote(path), quote(tmpdir)),
              shell=True)
         success = snakemake(snakefile,
                             cores=cores,
                             workdir=tmpdir,
                             stats="stats.txt",
-                            snakemakepath=SCRIPTPATH,
                             config=config, **params)
         if shouldfail:
             assert not success, "expected error on execution"
@@ -188,6 +191,14 @@ def test_conditional():
         targets="test.out test.0.out test.1.out test.2.out".split())
 
 
+def test_unpack_dict():
+    run(dpath("test_unpack_dict"))
+
+
+def test_unpack_list():
+    run(dpath("test_unpack_list"))
+
+
 def test_shell():
     run(dpath("test_shell"))
 
@@ -219,7 +230,11 @@ def test_ruledeps():
 
 
 def test_persistent_dict():
-    run(dpath("test_persistent_dict"))
+    try:
+        import pytools
+        run(dpath("test_persistent_dict"))
+    except ImportError:
+        pass
 
 
 def test_url_include():
@@ -328,7 +343,7 @@ def test_nonstr_params():
 
 
 def test_delete_output():
-    run(dpath("test_delete_output"))
+    run(dpath("test_delete_output"), cores=1)
 
 
 def test_input_generator():
@@ -342,7 +357,12 @@ def test_symlink_time_handling():
 
 
 def test_issue328():
-    run(dpath("test_issue328"), forcerun=["split"])
+    try:
+        import pytools
+        run(dpath("test_issue328"), forcerun=["split"])
+    except ImportError:
+        # skip test if import fails
+        pass
 
 
 def test_conda():
@@ -406,6 +426,66 @@ def test_deferred_func_eval():
 
 def test_format_params():
     run(dpath("test_format_params"), check_md5=True)
+
+
+def test_rule_defined_in_for_loop():
+    # issue 257
+    run(dpath("test_rule_defined_in_for_loop"))
+
+
+def test_issue381():
+    run(dpath("test_issue381"))
+
+
+def test_format_wildcards():
+    run(dpath("test_format_wildcards"))
+
+
+def test_with_parentheses():
+    run(dpath("test (with parentheses)"))
+
+
+def test_dup_out_patterns():
+    """Duplicate output patterns should emit an error
+
+    Duplicate output patterns can be detected on the rule level
+    """
+    run(dpath("test_dup_out_patterns"), shouldfail=True)
+
+
+def test_restartable_job_cmd_exit_1():
+    """Test the restartable job feature on ``exit 1``
+
+    The shell snippet in the Snakemake file will fail the first time
+    and succeed the second time.
+    """
+    # Even two consecutive times should fail as files are cleared
+    run(dpath("test_restartable_job_cmd_exit_1"), cluster="./qsub",
+        restart_times=0, shouldfail=True)
+    run(dpath("test_restartable_job_cmd_exit_1"), cluster="./qsub",
+        restart_times=0, shouldfail=True)
+    # Restarting once is enough
+    run(dpath("test_restartable_job_cmd_exit_1"), cluster="./qsub",
+        restart_times=1, shouldfail=False)
+
+
+def test_restartable_job_qsub_exit_1():
+    """Test the restartable job feature when qsub fails
+
+    The qsub in the sub directory will fail the first time and succeed the
+    second time.
+    """
+    # Even two consecutive times should fail as files are cleared
+    run(dpath("test_restartable_job_qsub_exit_1"), cluster="./qsub",
+        restart_times=0, shouldfail=True)
+    run(dpath("test_restartable_job_qsub_exit_1"), cluster="./qsub",
+        restart_times=0, shouldfail=True)
+    # Restarting once is enough
+    run(dpath("test_restartable_job_qsub_exit_1"), cluster="./qsub",
+        restart_times=1, shouldfail=False)
+
+def test_threads():
+    run(dpath("test_threads"), cores=20)
 
 
 if __name__ == '__main__':

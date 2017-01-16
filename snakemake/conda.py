@@ -4,6 +4,7 @@ import tempfile
 from urllib.request import urlopen
 import hashlib
 import shutil
+from distutils.version import StrictVersion
 
 from snakemake.exceptions import CreateCondaEnvironmentException
 from snakemake.logging import logger
@@ -13,6 +14,16 @@ def create_env(job):
     """ Create conda enviroment for the given job. """
     if shutil.which("conda") is None:
         raise CreateCondaEnvironmentException("The 'conda' command is not available in $PATH.")
+    try:
+        version = subprocess.check_output(["conda", "--version"], stderr=subprocess.STDOUT).decode().split()[1]
+        if StrictVersion(version) < StrictVersion("4.2"):
+            raise CreateCondaEnvironmentException(
+                "Conda must be version 4.2 or later."
+            )
+    except subprocess.CalledProcessError as e:
+        raise CreateCondaEnvironmentException(
+            "Unable to check conda version:\n" + e.output.decode()
+        )
 
     md5hash = hashlib.md5()
     env_file = job.conda_env_file
@@ -20,13 +31,17 @@ def create_env(job):
         with open(env_file, 'rb') as f:
             md5hash.update(f.read())
     else:
-        content = urlopen(env_file).read()
+        if env_file.startswith('file://'):
+            with open(env_file.replace('file://', ''), 'rb') as handle:
+                    content = handle.read()
+        else:
+            content = urlopen(env_file).read()
         md5hash.update(content)
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(content)
             env_file = tmp.name
 
-    env_path = os.path.join(job.rule.workflow.persistence.conda_env_path, md5hash.hexdigest())
+    env_path = os.path.join(job.rule.workflow.persistence.conda_env_path, md5hash.hexdigest()[:8])
     if not os.path.exists(env_path):
         logger.info("Creating conda environment for {}...".format(job.conda_env_file))
         try:

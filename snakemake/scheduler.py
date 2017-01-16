@@ -5,7 +5,6 @@ __license__ = "MIT"
 
 import os, signal
 import threading
-import multiprocessing
 import operator
 from functools import partial
 from collections import defaultdict
@@ -60,15 +59,9 @@ class JobScheduler:
 
         self.resources = dict(self.workflow.global_resources)
 
-        # we should use threads on a cluster, because shared memory /dev/shm may be full
-        # which prevents the multiprocessing.Lock() semaphore from being created
         use_threads = force_use_threads or (os.name != "posix") or cluster or cluster_sync or drmaa
-        if not use_threads:
-            self._open_jobs = multiprocessing.Event()
-            self._lock = multiprocessing.Lock()
-        else:
-            self._open_jobs = threading.Event()
-            self._lock = threading.Lock()
+        self._open_jobs = threading.Event()
+        self._lock = threading.Lock()
 
         self._errors = False
         self._finished = False
@@ -99,9 +92,10 @@ class JobScheduler:
                 printreason=printreason,
                 quiet=quiet,
                 printshellcmds=printshellcmds,
-                threads=use_threads,
+                use_threads=use_threads,
                 latency_wait=latency_wait,
-                benchmark_repeats=benchmark_repeats)
+                benchmark_repeats=benchmark_repeats,
+                cores=local_cores)
             self.run = self.run_cluster_or_local
             if cluster or cluster_sync:
                 constructor = SynchronousClusterExecutor if cluster_sync \
@@ -145,9 +139,10 @@ class JobScheduler:
                                          printreason=printreason,
                                          quiet=quiet,
                                          printshellcmds=printshellcmds,
-                                         threads=use_threads,
+                                         use_threads=use_threads,
                                          latency_wait=latency_wait,
-                                         benchmark_repeats=benchmark_repeats, )
+                                         benchmark_repeats=benchmark_repeats,
+                                         cores=cores)
         self._open_jobs.set()
 
     @property
@@ -277,16 +272,29 @@ class JobScheduler:
                 self._open_jobs.set()
 
     def _error(self, job):
-        """ Clear jobs and stop the workflow. """
-        # TODO count down number of retries in job. If not zero, reschedule instead of failing.
+        """Clear jobs and stop the workflow.
+
+        If Snakemake is configured to restart jobs then the job might have
+        "restart_times" left and we just decrement and let the scheduler
+        try to run the job again.
+        """
         with self._lock:
-            self._errors = True
             self.running.remove(job)
-            self.failed.add(job)
             self._free_resources(job)
-            if self.keepgoing:
-                logger.info("Job failed, going on with independent jobs.")
             self._open_jobs.set()
+            if job.restart_times > 0:
+                msg = (
+                    ("Trying to restart job for rule {} with "
+                     "wildcards {}").format(
+                         job.rule.name, job.wildcards_dict))
+                logger.info(msg
+                    )
+                job.restart_times -= 1
+            else:
+                self._errors = True
+                self.failed.add(job)
+                if self.keepgoing:
+                    logger.info("Job failed, going on with independent jobs.")
 
     def job_selector(self, jobs):
         """

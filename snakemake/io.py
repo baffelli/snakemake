@@ -3,14 +3,17 @@ __copyright__ = "Copyright 2015, Johannes Köster"
 __email__ = "koester@jimmy.harvard.edu"
 __license__ = "MIT"
 
+import collections
 import os
 import shutil
 import re
 import stat
 import time
+import datetime
 import json
 import copy
 import functools
+import subprocess as sp
 from itertools import product, chain
 from collections import Iterable, namedtuple
 from snakemake.exceptions import MissingOutputException, WorkflowError, WildcardError, RemoteFileException
@@ -32,21 +35,31 @@ def lutime(f, times):
     #target of a link.
     if os.utime in os.supports_follow_symlinks:
         #...utime is well behaved
-        return os.utime(f, times, follow_symlinks=False)
+        os.utime(f, times, follow_symlinks=False)
     elif not os.path.islink(f):
         #...symlinks not an issue here
-        return os.utime(f, times)
+        os.utime(f, times)
     else:
+        try:
+            # try the system command
+            if times:
+                fmt_time = lambda sec: datetime.fromtimestamp(sec).strftime("%Y%m%d%H%M.%S")
+                atime, mtime = times
+                sp.check_call(["touch", "-h", f, "-a", "-t", fmt_time(atime)])
+                sp.check_call(["touch", "-h", f, "-m", "-t", fmt_time(mtime)])
+            else:
+                sp.check_call(["touch", "-h", f])
+        except sp.CalledProcessError:
+            pass
         #...problem system.  Do nothing.
-        logger.warning("Unable to set utime on symlink {}.  Your Python build does not support it.".format(f))
+        logger.warning("Unable to set utime on symlink {}. Your Python build does not support it.".format(f))
         return None
 
 
 def lchmod(f, mode):
-    return os.chmod(
-        f,
-        mode,
-        follow_symlinks=os.chmod not in os.supports_follow_symlinks)
+    os.chmod(f,
+             mode,
+             follow_symlinks=os.chmod not in os.supports_follow_symlinks)
 
 
 def IOFile(file, rule=None):
@@ -63,6 +76,8 @@ class _IOFile(str):
     def __new__(cls, file):
         obj = str.__new__(cls, file)
         obj._is_function = isfunction(file) or ismethod(file)
+        obj._is_function = obj._is_function or (
+            isinstance(file, AnnotatedString) and bool(file.callable))
         obj._file = file
         obj.rule = None
         obj._regex = None
@@ -121,11 +136,17 @@ class _IOFile(str):
 
     def check(self):
         if self._file.startswith("./"):
-            logger.warning("Relative file path {} starts with './'. This is redundant "
+            logger.warning("Relative file path '{}' starts with './'. This is redundant "
                            "and strongly discouraged. It can also lead to "
                            "inconsistent results of the file-matching approach "
                            "used by Snakemake. You can simply omit the './' "
                            "for relative file paths.".format(self._file))
+        if self._file.startswith(" "):
+            logger.warning("File path '{}' starts with whitespace. This is likely unintended.")
+        if self._file.endswith(" "):
+            logger.warning("File path '{}' ends with whitespace. This is likely unintended.")
+        if "\n" in self._file:
+            logger.warning("File path '{}' contains line break. This is likely unintended.")
 
     @property
     @_refer_to_remote
@@ -364,21 +385,25 @@ def contains_wildcard_constraints(pattern):
 
 
 def remove(file, remove_non_empty_dir=False):
-    if os.path.exists(file):
-        if os.path.isdir(file):
-            if remove_non_empty_dir:
-                shutil.rmtree(file)
-            else:
-                try:
-                    os.removedirs(file)
-                except OSError as e:
-                    # skip non empty directories
-                    if e.errno == 39:
-                        logger.info("Skipped removing empty directory {}".format(e.filename))
-                    else:
-                        logger.warning(str(e))
+    if os.path.isdir(file) and not os.path.islink(file):
+        if remove_non_empty_dir:
+            shutil.rmtree(file)
         else:
+            try:
+                os.removedirs(file)
+            except OSError as e:
+                # skip non empty directories
+                if e.errno == 39:
+                    logger.info("Skipped removing non-empty directory {}".format(e.filename))
+                else:
+                    logger.warning(str(e))
+    #Remember that dangling symlinks fail the os.path.exists() test, but
+    #we definitely still want to zap them. try/except is the safest way.
+    else:
+        try:
             os.remove(file)
+        except FileNotFoundError:
+            pass
 
 
 def regex(filepattern):
@@ -428,17 +453,20 @@ def apply_wildcards(pattern,
     return re.sub(_wildcard_regex, format_match, pattern)
 
 
-
-
-
 def not_iterable(value):
     return isinstance(value, str) or isinstance(value, dict) or not isinstance(
         value, Iterable)
 
 
+def is_callable(value):
+    return (callable(value) or
+            (isinstance(value, _IOFile) and value._is_function))
+
+
 class AnnotatedString(str):
     def __init__(self, value):
         self.flags = dict()
+        self.callable = value if is_callable(value) else None
 
 
 def flag(value, flag_type, flag_value=True):
@@ -525,6 +553,8 @@ def dynamic(value):
 def touch(value):
     return flag(value, "touch")
 
+def unpack(value):
+    return flag(value, "unpack")
 
 def expand(*args, **wildcards):
     """
@@ -792,7 +822,7 @@ def _load_configfile(configpath):
     try:
         with open(configpath) as f:
             try:
-                return json.load(f)
+                return json.load(f, object_pairs_hook=collections.OrderedDict)
             except ValueError:
                 f.seek(0)  # try again
             try:
@@ -802,7 +832,17 @@ def _load_configfile(configpath):
                                     "has not been installed. Please install "
                                     "PyYAML to use YAML config files.")
             try:
-                return yaml.load(f)
+                # From http://stackoverflow.com/a/21912744/84349
+                class OrderedLoader(yaml.Loader):
+                    pass
+                def construct_mapping(loader, node):
+                    loader.flatten_mapping(node)
+                    return collections.OrderedDict(
+                        loader.construct_pairs(node))
+                OrderedLoader.add_constructor(
+                    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                    construct_mapping)
+                return yaml.load(f, OrderedLoader)
             except yaml.YAMLError:
                 raise WorkflowError("Config file is not valid JSON or YAML. "
                                     "In case of YAML, make sure to not mix "

@@ -15,7 +15,7 @@ from itertools import chain
 from functools import partial
 from operator import attrgetter
 
-from snakemake.io import IOFile, Wildcards, Resources, _IOFile, is_flagged, contains_wildcard
+from snakemake.io import IOFile, Wildcards, Resources, _IOFile, is_flagged, contains_wildcard, lstat
 from snakemake.utils import format, listfiles
 from snakemake.exceptions import RuleException, ProtectedOutputException, WorkflowError
 from snakemake.exceptions import UnexpectedOutputException, CreateCondaEnvironmentException
@@ -54,6 +54,8 @@ class Job:
         self.shadow_dir = None
         self._inputsize = None
 
+        self.restart_times = self.rule.restart_times
+
         self.dynamic_output, self.dynamic_input = set(), set()
         self.temp_output, self.protected_output = set(), set()
         self.touch_output = set()
@@ -86,6 +88,17 @@ class Job:
         self.rule.expand_params(self.wildcards_dict, self.input, resources)
         self.rule.expand_benchmark(self.wildcards_dict)
         self.rule.expand_log(self.wildcards_dict)
+
+    def outputs_older_than_script(self):
+        """return output that's older than script, i.e. script has changed"""
+        if not self.is_script:
+            return
+        assert os.path.exists(self.rule.script)# to make sure lstat works
+        script_mtime = lstat(self.rule.script).st_mtime
+        for f in self.expanded_output:
+            if f.exists:
+                if not f.is_newer(script_mtime):
+                    yield f
 
     @property
     def threads(self):
@@ -192,6 +205,22 @@ class Job:
             raise RuleException("Unknown variable when printing "
                                 "shell command: {}".format(str(ex)),
                                 rule=self.rule)
+
+    @property
+    def is_shell(self):
+        return self.rule.shellcmd is not None
+
+    @property
+    def is_norun(self):
+        return self.rule.norun
+
+    @property
+    def is_script(self):
+        return self.rule.script is not None
+
+    @property
+    def is_wrapper(self):
+        return self.rule.wrapper is not None
 
     @property
     def expanded_output(self):
@@ -427,6 +456,8 @@ class Job:
                 "present when the DAG was created:\n{}".format(
                     self.rule, unexpected_output))
 
+        self.remove_existing_output()
+
         for f, f_ in zip(self.output, self.rule.output):
             f.prepare()
 
@@ -437,8 +468,6 @@ class Job:
             f.prepare()
         if self.benchmark:
             self.benchmark.prepare()
-
-        self.remove_existing_output()
 
         if not self.is_shadow:
             return

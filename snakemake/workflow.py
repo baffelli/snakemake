@@ -23,17 +23,17 @@ from snakemake.dag import DAG
 from snakemake.scheduler import JobScheduler
 from snakemake.parser import parse
 import snakemake.io
-from snakemake.io import protected, temp, temporary, ancient, expand, dynamic, glob_wildcards, flag, not_iterable, touch
+from snakemake.io import protected, temp, temporary, ancient, expand, dynamic, glob_wildcards, flag, not_iterable, touch, unpack
 from snakemake.persistence import Persistence
 from snakemake.utils import update_config
 from snakemake.script import script
 from snakemake.wrapper import wrapper
 import snakemake.wrapper
+from snakemake.common import Mode
 
 class Workflow:
     def __init__(self,
                  snakefile=None,
-                 snakemakepath=None,
                  jobscript=None,
                  overwrite_shellcmd=None,
                  overwrite_config=dict(),
@@ -42,7 +42,11 @@ class Workflow:
                  overwrite_clusterconfig=dict(),
                  config_args=None,
                  debug=False,
-                 use_conda=False):
+                 use_conda=False,
+                 mode=Mode.default,
+                 wrapper_prefix=None,
+                 printshellcmds=False,
+                 restart_times=None):
         """
         Create the controller.
         """
@@ -57,7 +61,6 @@ class Workflow:
         self.rule_count = 0
         self.basedir = os.path.dirname(snakefile)
         self.snakefile = os.path.abspath(snakefile)
-        self.snakemakepath = snakemakepath
         self.included = []
         self.included_stack = []
         self.jobscript = jobscript
@@ -78,6 +81,10 @@ class Workflow:
         self.debug = debug
         self._rulecount = 0
         self.use_conda = use_conda
+        self.mode = mode
+        self.wrapper_prefix = wrapper_prefix
+        self.printshellcmds = printshellcmds
+        self.restart_times = restart_times
 
         global config
         config = dict()
@@ -407,6 +414,8 @@ class Workflow:
             return True
         elif list_code_changes:
             items = list(chain(*map(self.persistence.code_changed, dag.jobs)))
+            for j in dag.jobs:
+                items.extend(list(j.outputs_older_than_script()))
             if items:
                 print(*items, sep="\n")
             return True
@@ -488,6 +497,12 @@ class Workflow:
                 self._onerror(logger.get_logfile())
             return False
 
+    @property
+    def current_basedir(self):
+        """Basedir of currently parsed Snakefile."""
+        assert self.included_stack
+        return os.path.abspath(os.path.dirname(self.included_stack[-1]))
+
     def include(self, snakefile,
                 overwrite_first_rule=False,
                 print_compilation=False,
@@ -498,8 +513,7 @@ class Workflow:
         # check if snakefile is a path to the filesystem
         if not urllib.parse.urlparse(snakefile).scheme:
             if not os.path.isabs(snakefile) and self.included_stack:
-                current_path = os.path.dirname(self.included_stack[-1])
-                snakefile = os.path.join(current_path, snakefile)
+                snakefile = os.path.join(self.current_basedir, snakefile)
             # Could still be an url if relative import was used
             if not urllib.parse.urlparse(snakefile).scheme:
                 snakefile = os.path.abspath(snakefile)
@@ -536,18 +550,23 @@ class Workflow:
         self.included_stack.pop()
 
     def onstart(self, func):
+        """Register onstart function."""
         self._onstart = func
 
     def onsuccess(self, func):
+        """Register onsuccess function."""
         self._onsuccess = func
 
     def onerror(self, func):
+        """Register onerror function."""
         self._onerror = func
 
     def global_wildcard_constraints(self, **content):
+        """Register global wildcard constraints."""
         self._wildcard_constraints.update(content)
 
     def workdir(self, workdir):
+        """Register workdir."""
         if self.overwrite_workdir is None:
             os.makedirs(workdir, exist_ok=True)
             self._workdir = workdir
@@ -625,6 +644,8 @@ class Workflow:
             if ruleinfo.wrapper:
                 rule.conda_env = snakemake.wrapper.get_conda_env(ruleinfo.wrapper)
             if ruleinfo.conda_env:
+                if not os.path.isabs(ruleinfo.conda_env):
+                    ruleinfo.conda_env = os.path.join(self.current_basedir, ruleinfo.conda_env)
                 rule.conda_env = ruleinfo.conda_env
             rule.norun = ruleinfo.norun
             rule.docstring = ruleinfo.docstring
@@ -632,6 +653,8 @@ class Workflow:
             rule.shellcmd = ruleinfo.shellcmd
             rule.script = ruleinfo.script
             rule.wrapper = ruleinfo.wrapper
+            rule.restart_times=self.restart_times
+
             ruleinfo.func.__name__ = "__{}".format(name)
             self.globals[ruleinfo.func.__name__] = ruleinfo.func
             setattr(rules, name, rule)

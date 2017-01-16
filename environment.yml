@@ -1,7 +1,10 @@
 channels:
   - bioconda
   - r
+  - anaconda
+  - conda-forge
 dependencies:
+  - python >=3.3
   - rpy2 >=0.7.6
   - boto
   - moto
@@ -15,3 +18,9 @@ dependencies:
   - dropbox
   - numpy
   - appdirs
+  - pytools
+  - docutils
+  - sphinx
+  - pip:
+    - sphinxcontrib-napoleon
+    - sphinx_rtd_theme

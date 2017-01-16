@@ -23,6 +23,7 @@ from snakemake.version import __version__
 from snakemake.io import load_configfile
 from snakemake.shell import shell
 from snakemake.utils import update_config, available_cpu_count
+from snakemake.common import Mode
 
 def snakemake(snakefile,
               listrules=False,
@@ -94,9 +95,12 @@ def snakemake(snakefile,
               log_handler=None,
               keep_logger=False,
               max_jobs_per_second=None,
+              restart_times=0,
               verbose=False,
               force_use_threads=False,
-              use_conda=False):
+              use_conda=False,
+              mode=Mode.default,
+              wrapper_prefix=None):
     """Run snakemake on a given snakefile.
 
     This function provides access to the whole snakemake functionality. It is not thread-safe.
@@ -135,7 +139,7 @@ def snakemake(snakefile,
         immediate_submit (bool):    immediately submit all cluster jobs, regardless of dependencies (default False)
         standalone (bool):          kill all processes very rudely in case of failure (do not use this if you use this API) (default False) (deprecated)
         ignore_ambiguity (bool):    ignore ambiguous rules and always take the first possible one (default False)
-        snakemakepath (str):        path to the snakemake executable (default None)
+        snakemakepath (str):        Deprecated parameter whose value is ignored. Do not use.
         lock (bool):                lock the working directory when executing the workflow (default True)
         unlock (bool):              just unlock the working directory (default False)
         cleanup_metadata (bool):    just cleanup metadata of output files (default False)
@@ -165,11 +169,14 @@ def snakemake(snakefile,
         greediness (float):         set the greediness of scheduling. This value between 0 and 1 determines how careful jobs are selected for execution. The default value (0.5 if prioritytargets are used, 1.0 else) provides the best speed and still acceptable scheduling quality.
         overwrite_shellcmd (str):   a shell command that shall be executed instead of those given in the workflow. This is for debugging purposes only.
         updated_files(list):        a list that will be filled with the files that are updated or created during the workflow execution
-        verbose (bool):              show additional debug output (default False)
-        log_handler (function):     redirect snakemake output to this custom log handler, a function that takes a log message dictionary (see below) as its only argument (default None). The log message dictionary for the log handler has to following entries:
-        max_jobs_per_second:        maximal number of cluster/drmaa jobs per second, None to impose no limit (default None)
+        verbose (bool):             show additional debug output (default False)
+        max_jobs_per_second (int):  maximal number of cluster/drmaa jobs per second, None to impose no limit (default None)
+        restart_times (int):        number of times to restart failing jobs (default 1)
         force_use_threads:          whether to force use of threads over processes. helpful if shared memory is full or unavailable (default False)
         use_conda (bool):           create conda environments for each job (defined with conda directive of rules)
+        mode (snakemake.common.Mode): Execution mode
+        wrapper_prefix (str):       Prefix for wrapper script URLs (default None)
+        log_handler (function):     redirect snakemake output to this custom log handler, a function that takes a log message dictionary (see below) as its only argument (default None). The log message dictionary for the log handler has to following entries:
 
             :level:
                 the log level ("info", "error", "debug", "progress", "job_info")
@@ -249,7 +256,8 @@ def snakemake(snakefile,
                      stdout=dryrun and not (printdag or printd3dag or printrulegraph),
                      debug=verbose,
                      timestamp=timestamp,
-                     use_threads=use_threads)
+                     use_threads=use_threads,
+                     mode=mode)
 
     if greediness is None:
         greediness = 0.5 if prioritytargets else 1.0
@@ -288,7 +296,6 @@ def snakemake(snakefile,
         workdir = os.path.abspath(workdir)
         os.chdir(workdir)
     workflow = Workflow(snakefile=snakefile,
-                        snakemakepath=snakemakepath,
                         jobscript=jobscript,
                         overwrite_shellcmd=overwrite_shellcmd,
                         overwrite_config=overwrite_config,
@@ -297,7 +304,11 @@ def snakemake(snakefile,
                         overwrite_clusterconfig=cluster_config,
                         config_args=config_args,
                         debug=debug,
-                        use_conda=use_conda)
+                        use_conda=use_conda,
+                        mode=mode,
+                        wrapper_prefix=wrapper_prefix,
+                        printshellcmds=printshellcmds,
+                        restart_times=restart_times)
     success = True
     try:
         workflow.include(snakefile,
@@ -334,7 +345,6 @@ def snakemake(snakefile,
                                        immediate_submit=immediate_submit,
                                        standalone=standalone,
                                        ignore_ambiguity=ignore_ambiguity,
-                                       snakemakepath=snakemakepath,
                                        lock=lock,
                                        unlock=unlock,
                                        cleanup_metadata=cleanup_metadata,
@@ -428,6 +438,7 @@ def snakemake(snakefile,
 
 
 def parse_resources(args):
+    """Parse resources from args."""
     resources = dict()
     if args.resources is not None:
         valid = re.compile("[a-zA-Z_]\w*$")
@@ -453,6 +464,7 @@ def parse_resources(args):
 
 
 def parse_config(args):
+    """Parse config from args."""
     parsers = [int, float, eval, str]
     config = dict()
     if args.config is not None:
@@ -481,6 +493,7 @@ def parse_config(args):
 
 
 def get_argument_parser():
+    """Generate and return argument parser."""
     parser = argparse.ArgumentParser(
         description="Snakemake is a Python based language and execution "
         "environment for GNU Make-like workflows.")
@@ -853,6 +866,10 @@ def get_argument_parser():
         "--max-jobs-per-second", default=None, type=float,
         help=
         "Maximal number of cluster/drmaa jobs per second, default is no limit")
+    parser.add_argument(
+        "--restart-times", default=0, type=int,
+        help=
+        "Number of times to restart failing jobs (defaults to 0).")
     parser.add_argument('--timestamp', '-T',
                         action='store_true',
                         help='Add a timestamp to all logging output')
@@ -891,6 +908,13 @@ def get_argument_parser():
         "Profile Snakemake and write the output to FILE. This requires yappi "
         "to be installed.")
     parser.add_argument(
+        "--mode",
+        choices=[Mode.default, Mode.subprocess, Mode.cluster],
+        default=Mode.default,
+        type=int,
+        help="Set execution mode of Snakemake (internal use only)."
+    )
+    parser.add_argument(
         "--bash-completion",
         action="store_true",
         help="Output code to register bash completion for snakemake. Put the "
@@ -902,22 +926,28 @@ def get_argument_parser():
         action="store_true",
         help="If defined in the rule, create job specific conda environments. "
         "If this flag is not set, the conda directive is ignored.")
+    parser.add_argument(
+        "--wrapper-prefix",
+        default="https://bitbucket.org/snakemake/snakemake-wrappers/raw/",
+        help="Prefix for URL created from wrapper directive (default: "
+        "https://bitbucket.org/snakemake/snakemake-wrappers/raw/). Set this to "
+        "a different URL to use your fork or a local clone of the repository."
+    )
     parser.add_argument("--version", "-v",
                         action="version",
                         version=__version__)
     return parser
 
 
-def main():
+def main(argv=None):
+    """Main entry point."""
     parser = get_argument_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.bash_completion:
         cmd = b"complete -o bashdefault -C snakemake-bash-completion snakemake"
         sys.stdout.buffer.write(cmd)
         sys.exit(0)
-
-    snakemakepath = sys.argv[0]
 
     try:
         resources = parse_resources(args)
@@ -956,8 +986,7 @@ def main():
 
         _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
 
-        _snakemake = partial(snakemake, os.path.abspath(args.snakefile),
-                             snakemakepath=snakemakepath)
+        _snakemake = partial(snakemake, os.path.abspath(args.snakefile))
         gui.register(_snakemake, args)
         url = "http://127.0.0.1:{}".format(args.gui)
         print("Listening on {}.".format(url), file=sys.stderr)
@@ -982,6 +1011,7 @@ def main():
                             listrules=args.list,
                             list_target_rules=args.list_target_rules,
                             cores=args.cores,
+                            local_cores=args.local_cores,
                             nodes=args.cores,
                             resources=resources,
                             config=config,
@@ -1014,7 +1044,6 @@ def main():
                             immediate_submit=args.immediate_submit,
                             standalone=True,
                             ignore_ambiguity=args.allow_ambiguity,
-                            snakemakepath=snakemakepath,
                             lock=not args.nolock,
                             unlock=args.unlock,
                             cleanup_metadata=args.cleanup_metadata,
@@ -1043,8 +1072,11 @@ def main():
                             keep_shadow=args.keep_shadow,
                             allowed_rules=args.allowed_rules,
                             max_jobs_per_second=args.max_jobs_per_second,
+                            restart_times=args.restart_times,
                             force_use_threads=args.force_use_threads,
-                            use_conda=args.use_conda)
+                            use_conda=args.use_conda,
+                            mode=args.mode,
+                            wrapper_prefix=args.wrapper_prefix)
 
     if args.profile:
         with open(args.profile, "w") as out:
@@ -1056,6 +1088,7 @@ def main():
 
 
 def bash_completion(snakefile="Snakefile"):
+    """Entry point for bash completion."""
     if not len(sys.argv) >= 2:
         print(
             "Calculate bash completion for snakemake. This tool shall not be invoked by hand.")
@@ -1079,7 +1112,7 @@ def bash_completion(snakefile="Snakefile"):
         if files:
             print_candidates(files)
         elif os.path.exists(snakefile):
-            workflow = Workflow(snakefile=snakefile, snakemakepath="snakemake")
+            workflow = Workflow(snakefile=snakefile)
             workflow.include(snakefile)
 
             print_candidates([file
