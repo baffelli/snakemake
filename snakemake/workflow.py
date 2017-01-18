@@ -209,6 +209,7 @@ class Workflow:
                 list_input_changes=False,
                 list_params_changes=False,
                 summary=False,
+                archive=None,
                 detailed_summary=False,
                 latency_wait=3,
                 benchmark_repeats=3,
@@ -312,7 +313,7 @@ class Workflow:
         self.persistence = Persistence(
             nolock=nolock,
             dag=dag,
-            warn_only=dryrun or printrulegraph or printdag or summary or
+            warn_only=dryrun or printrulegraph or printdag or summary or archive or
             list_version_changes or list_code_changes or list_input_changes or
             list_params_changes)
 
@@ -405,6 +406,9 @@ class Workflow:
             return True
         elif detailed_summary:
             print("\n".join(dag.summary(detailed=True)))
+            return True
+        elif archive:
+            dag.archive(archive)
             return True
         elif list_version_changes:
             items = list(
@@ -583,6 +587,9 @@ class Workflow:
         self._ruleorder.add(*rulenames)
 
     def subworkflow(self, name, snakefile=None, workdir=None, configfile=None):
+        # Take absolute path of config file, because it is relative to current
+        # workdir, which could be changed for the subworkflow.
+        configfile = os.path.abspath(configfile)
         sw = Subworkflow(self, name, snakefile, workdir, configfile)
         self._subworkflows[name] = sw
         self.globals[name] = sw.target
